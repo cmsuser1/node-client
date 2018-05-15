@@ -1,14 +1,20 @@
 const requestPromise = require('request-promise');
 const request = require('request');
 const repl = require('repl');
-const fs = require('fs')
-const baseUrl = 'http://localhost:3000/'; // Change Me.
+const fs = require('fs');
+const simpleOAuth2 = require('simple-oauth2');
+const uuid4 = require('uuid/v4');
+const url = require('url');
+const assert = require('assert');
 
-let options = (uri, baseUrl = client.getBaseUrl()) => {
+let options = (uri, baseUrl = client.getBaseUrl(), authToken = client.getCurrentToken()) => {
   return {
     method: 'GET',
     uri: baseUrl + uri,
-    resolveWithFullResponse: true
+    resolveWithFullResponse: true,
+    headers: {
+      'Authorization': 'Bearer ' + authToken.token.access_token,
+    },
   };
 };
 
@@ -21,11 +27,70 @@ let client = {
     baseUrl = url;
   },
 
+  setAuth: (clientId, clientSecret, redirectUri) => {
+    this.clientId = clientId;
+    this.clientSecret = clientSecret;
+    this.redirectUri = redirectUri;
+    this.oauth2 = simpleOAuth2.create({
+      client: {
+        id: clientId,
+        secret: clientSecret,
+      },
+      auth: {
+        tokenHost: baseUrl,
+      },
+    });
+  },
+
+  getAuthUrl: () => {
+    this.state = uuid4();
+    let uri = this.oauth2.authorizationCode.authorizeURL({
+      redirect_uri: this.redirectUri,
+      scope: 'export',
+      state: this.state,
+    });
+    return {
+      'uri': uri,
+      'state': this.state,
+    };
+  },
+
+  fetchToken: (redirect) => {
+    let respUrl = new URL(redirect);
+
+    assert.strictEqual(respUrl.searchParams.get('state'), this.state,
+      'Server redirect response state nonce did not match!');
+
+    let authCode = respUrl.searchParams.get('code');
+
+    this.oauth2.authorizationCode.getToken({
+      code: authCode,
+      redirect_uri: this.redirectUri,
+      scope: 'export',
+    }).then(
+      tokenResult => {
+        this.currentToken = this.oauth2.accessToken.create(tokenResult);
+      },
+      error => {
+        console.log('Failed to retrieve access token', error.message);
+      });
+  },
+
+  getCurrentToken: () => { return this.currentToken; },
+
+  setCurrentToken: (authToken, expires='86400') => {
+    this.token = this.oauth2.accessToken.create({
+      'access_token': authToken,
+      'refresh_token': '',
+      'expires_in': expires,
+    });
+  },
+
   checkJobStatus: (response, acoId) => {
     if(response.statusCode === 202){
       let body = JSON.parse(response.body);
       setTimeout(() => {
-        requestPromise(options(`beneficiary/${acoId}/$export/${body.jobId}`))
+        requestPromise(options(`beneficiary/${acoId}/export/${body.external_id}`))
           .then(function (response) {
             return client.checkJobStatus(response, acoId);
           })
@@ -34,6 +99,7 @@ let client = {
           });
       }, body["retry"]);
     }else if(response.statusCode === 200){
+      console.log('Export finished: ' + response.body);
       client.downloadRequest(response);
     }
   },
@@ -41,11 +107,11 @@ let client = {
   downloadRequest: (response) => {
     let body = JSON.parse(response.body);
 
-    request(body.url).pipe(fs.createWriteStream("RESULT")) // "RESULT" needs to be changed to the name and format of the file returned. (e.g. aco-result.json)
+    request(options(body.url)).pipe(fs.createWriteStream("RESULT")) // "RESULT" needs to be changed to the name and format of the file returned. (e.g. aco-result.json)
   },
 
   getBulkRequest: (acoId = '') => {
-    requestPromise(options(`beneficiary/${acoId}/$export`))
+    requestPromise(options(`beneficiary/${acoId}/export`))
       .then(function (response) {
         return client.checkJobStatus(response, acoId);
       })
